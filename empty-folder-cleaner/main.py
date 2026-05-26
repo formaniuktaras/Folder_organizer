@@ -1,4 +1,5 @@
 import csv
+import getpass
 import json
 import os
 import sys
@@ -27,13 +28,6 @@ from PySide6.QtWidgets import (
 APP_NAME = "Empty Folder Cleaner"
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 
-# Заборонені системні шляхи Windows. Порівняння робимо через normcase/normpath.
-FORBIDDEN_PATHS = {
-    os.path.normcase(os.path.normpath(r"C:\\Windows")),
-    os.path.normcase(os.path.normpath(r"C:\\Program Files")),
-    os.path.normcase(os.path.normpath(r"C:\\Users")),
-}
-
 
 @dataclass
 class ScanResult:
@@ -47,22 +41,33 @@ class ScanResult:
 class ScanWorker(QObject):
     progress = Signal(object)
     log = Signal(str)
-    finished = Signal(list)
+    finished = Signal(list, bool)  # results, cancelled
 
-    def __init__(self, root_dir: str, target_names: list[str], dry_run: bool):
+    def __init__(self, root_dir: str, target_names: list[str]):
         super().__init__()
         self.root_dir = root_dir
         self.target_names = set(target_names)
-        self.dry_run = dry_run
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
 
     @Slot()
     def run(self):
         results: list[ScanResult] = []
-        self.log.emit(f"Почато сканування: {self.root_dir}")
+        cancelled = False
+
         try:
             for dirpath, dirnames, _ in os.walk(self.root_dir):
-                # Створюємо копію, щоб безпечно ітеруватись.
+                if self.cancel_requested:
+                    cancelled = True
+                    break
+
                 for dirname in list(dirnames):
+                    if self.cancel_requested:
+                        cancelled = True
+                        break
+
                     if dirname not in self.target_names:
                         continue
 
@@ -70,26 +75,29 @@ class ScanWorker(QObject):
                     try:
                         is_empty = self._is_folder_empty(folder_path)
                         status = "порожня" if is_empty else "не порожня"
-                        action = "буде видалено" if is_empty else "пропущено"
+                        action = "кандидат на видалення" if is_empty else "пропущено"
                         result = ScanResult(folder_path, dirname, status, action)
                         results.append(result)
                         self.progress.emit(result)
-                    except Exception as exc:
-                        result = ScanResult(
-                            folder_path,
-                            dirname,
-                            "помилка",
-                            "пропущено",
-                            error=str(exc),
-                        )
+                    except (PermissionError, FileNotFoundError, OSError) as exc:
+                        result = ScanResult(folder_path, dirname, "помилка", "пропущено", error=str(exc))
                         results.append(result)
                         self.progress.emit(result)
                         self.log.emit(f"Помилка доступу до '{folder_path}': {exc}")
-        except Exception as exc:
-            self.log.emit(f"Критична помилка сканування: {exc}")
+                    except Exception as exc:
+                        result = ScanResult(folder_path, dirname, "помилка", "пропущено", error=str(exc))
+                        results.append(result)
+                        self.progress.emit(result)
+                        self.log.emit(f"Неочікувана помилка для '{folder_path}': {exc}")
 
-        self.log.emit(f"Сканування завершено. Знайдено: {len(results)}")
-        self.finished.emit(results)
+                if cancelled:
+                    break
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            self.log.emit(f"Критична помилка сканування: {exc}")
+        except Exception as exc:
+            self.log.emit(f"Неочікувана критична помилка сканування: {exc}")
+
+        self.finished.emit(results, cancelled)
 
     @staticmethod
     def _is_folder_empty(folder_path: str) -> bool:
@@ -108,9 +116,11 @@ class MainWindow(QMainWindow):
         self.results: list[ScanResult] = []
         self.scan_thread: QThread | None = None
         self.scan_worker: ScanWorker | None = None
+        self.current_root_dir: str = ""
 
         self._build_ui()
         self._load_settings()
+        self._update_action_buttons_after_scan()
 
     def _build_ui(self):
         central = QWidget(self)
@@ -141,12 +151,19 @@ class MainWindow(QMainWindow):
         self.scan_btn.clicked.connect(self.start_scan)
         controls_layout.addWidget(self.scan_btn)
 
+        self.stop_scan_btn = QPushButton("Зупинити сканування")
+        self.stop_scan_btn.clicked.connect(self.stop_scan)
+        self.stop_scan_btn.setEnabled(False)
+        controls_layout.addWidget(self.stop_scan_btn)
+
         self.delete_btn = QPushButton("Видалити порожні")
         self.delete_btn.clicked.connect(self.delete_empty)
+        self.delete_btn.setEnabled(False)
         controls_layout.addWidget(self.delete_btn)
 
         self.export_btn = QPushButton("Експорт результатів у CSV")
         self.export_btn.clicked.connect(self.export_csv)
+        self.export_btn.setEnabled(False)
         controls_layout.addWidget(self.export_btn)
 
         self.clear_btn = QPushButton("Очистити результати")
@@ -161,7 +178,7 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(0, 600)
         self.table.setColumnWidth(1, 150)
         self.table.setColumnWidth(2, 120)
-        self.table.setColumnWidth(3, 120)
+        self.table.setColumnWidth(3, 180)
         main_layout.addWidget(self.table)
 
         main_layout.addWidget(QLabel("Журнал подій:"))
@@ -169,6 +186,40 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setFixedHeight(140)
         main_layout.addWidget(self.log_text)
+
+    def _normalize(self, path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+    def _is_subpath_or_same(self, parent: str, child: str) -> bool:
+        try:
+            return self._normalize(os.path.commonpath([parent, child])) == self._normalize(parent)
+        except ValueError:
+            return False
+
+    def _forbidden_paths(self) -> set[str]:
+        username = getpass.getuser()
+        drive_roots = [f"{drive}:\\" for drive in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{drive}:\\")]
+
+        hardcoded = [
+            r"C:\Windows",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+            r"C:\Users",
+            fr"C:\Users\{username}",
+            fr"C:\Users\{username}\Desktop",
+            fr"C:\Users\{username}\Documents",
+            fr"C:\Users\{username}\Downloads",
+        ]
+
+        return {self._normalize(p) for p in drive_roots + hardcoded if os.path.exists(p)}
+
+    def _is_forbidden_selected_root(self, candidate: str) -> bool:
+        normalized_candidate = self._normalize(candidate)
+        for forbidden in self._forbidden_paths():
+            if self._is_subpath_or_same(forbidden, normalized_candidate):
+                return True
+        return False
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Оберіть головну директорію")
@@ -189,6 +240,14 @@ class MainWindow(QMainWindow):
         if not os.path.isdir(root_dir):
             QMessageBox.warning(self, "Увага", "Вказана директорія не існує.")
             return False
+        if self._is_forbidden_selected_root(root_dir):
+            QMessageBox.warning(
+                self,
+                "Заборонена директорія",
+                "Обрана директорія належить до заборонених системних шляхів. Сканування скасовано.",
+            )
+            self.log(f"Спроба сканування забороненої директорії: {root_dir}")
+            return False
         return True
 
     def start_scan(self):
@@ -201,18 +260,20 @@ class MainWindow(QMainWindow):
             return
 
         self._save_settings()
-        self.clear_results()
-        self.log("Підготовка до сканування...")
+        self.clear_results(log_message=False)
+        self.current_root_dir = self.root_dir_edit.text().strip()
+
+        self.log("Початок сканування")
+        self.log(f"Обрана головна директорія: {self.current_root_dir}")
+        self.log(f"Кількість назв папок у списку: {len(target_names)}")
 
         self.scan_btn.setEnabled(False)
+        self.stop_scan_btn.setEnabled(True)
         self.delete_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
 
         self.scan_thread = QThread()
-        self.scan_worker = ScanWorker(
-            self.root_dir_edit.text().strip(),
-            target_names,
-            self.dry_run_checkbox.isChecked(),
-        )
+        self.scan_worker = ScanWorker(self.current_root_dir, target_names)
         self.scan_worker.moveToThread(self.scan_thread)
 
         self.scan_thread.started.connect(self.scan_worker.run)
@@ -225,13 +286,39 @@ class MainWindow(QMainWindow):
 
         self.scan_thread.start()
 
-    @Slot(list)
-    def _scan_finished(self, results: list[ScanResult]):
+    def stop_scan(self):
+        if self.scan_worker:
+            self.scan_worker.cancel()
+            self.stop_scan_btn.setEnabled(False)
+            self.log("Запит на зупинку сканування надіслано...")
+
+    @Slot(list, bool)
+    def _scan_finished(self, results: list[ScanResult], cancelled: bool):
         self.results = results
         self.scan_btn.setEnabled(True)
-        self.delete_btn.setEnabled(True)
+        self.stop_scan_btn.setEnabled(False)
+
+        matches = len(results)
         empty_count = sum(1 for r in results if r.status == "порожня")
-        self.log(f"Готово. Порожніх папок для обробки: {empty_count}")
+        non_empty_count = sum(1 for r in results if r.status == "не порожня")
+        errors_count = sum(1 for r in results if r.status == "помилка")
+
+        self.log(f"Кількість знайдених збігів: {matches}")
+        self.log(f"Кількість порожніх папок: {empty_count}")
+        self.log(f"Кількість непорожніх папок: {non_empty_count}")
+        self.log(f"Кількість помилок: {errors_count}")
+
+        if cancelled:
+            self.log("Сканування зупинено користувачем")
+        self.log("Завершення сканування")
+
+        self._update_action_buttons_after_scan()
+
+    def _update_action_buttons_after_scan(self):
+        has_results = len(self.results) > 0
+        can_delete = any(r.status == "порожня" and r.action == "кандидат на видалення" for r in self.results)
+        self.export_btn.setEnabled(has_results)
+        self.delete_btn.setEnabled(can_delete)
 
     @Slot(object)
     def _append_result(self, result: ScanResult):
@@ -247,71 +334,109 @@ class MainWindow(QMainWindow):
             return
 
         root_dir = os.path.abspath(self.root_dir_edit.text().strip())
-        norm_root = os.path.normcase(os.path.normpath(root_dir))
+        norm_root = self._normalize(root_dir)
         dry_run = self.dry_run_checkbox.isChecked()
 
-        candidates = [r for r in self.results if r.status == "порожня"]
+        candidates = [
+            r for r in self.results
+            if r.status == "порожня" and r.action == "кандидат на видалення"
+        ]
         if not candidates:
             QMessageBox.information(self, "Інформація", "Немає порожніх папок для видалення.")
-            return
-
-        if dry_run:
-            self.log("Тестовий режим увімкнений: видалення не виконується.")
-            QMessageBox.information(
-                self,
-                "Тестовий режим",
-                f"Тестовий режим: {len(candidates)} папок позначено як 'буде видалено'.",
-            )
             return
 
         confirm = QMessageBox.question(
             self,
             "Підтвердження видалення",
-            f"Ви дійсно хочете видалити {len(candidates)} порожніх папок?",
+            f"Ви дійсно хочете обробити {len(candidates)} порожніх папок?",
         )
         if confirm != QMessageBox.Yes:
             self.log("Користувач скасував видалення.")
             return
 
-        deleted_count = 0
-        for result in candidates:
-            target = os.path.abspath(result.path)
-            norm_target = os.path.normcase(os.path.normpath(target))
+        forbidden_paths = self._forbidden_paths()
 
-            # Критична логіка безпеки: не видаляємо root та системні каталоги.
-            if norm_target == norm_root or norm_target in FORBIDDEN_PATHS:
+        processed = 0
+        deleted_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for result in candidates:
+            processed += 1
+            target = os.path.abspath(result.path)
+            norm_target = self._normalize(target)
+
+            if norm_target == norm_root:
                 result.action = "пропущено"
-                self.log(f"Пропущено (заборонено): {target}")
+                skipped_count += 1
+                self.log(f"Пропущено головну директорію: {target}")
                 continue
 
-            # Додатковий захист: видалення тільки всередині root.
-            try:
-                common = os.path.commonpath([root_dir, target])
-            except ValueError:
-                common = ""
-            if os.path.normcase(os.path.normpath(common)) != norm_root:
+            if any(self._is_subpath_or_same(forbidden, norm_target) for forbidden in forbidden_paths):
                 result.action = "пропущено"
+                skipped_count += 1
+                self.log(f"Пропущено (заборонений системний шлях): {target}")
+                continue
+
+            if not self._is_subpath_or_same(root_dir, target):
+                result.action = "пропущено"
+                skipped_count += 1
                 self.log(f"Пропущено (поза головною директорією): {target}")
                 continue
 
+            if not os.path.exists(target):
+                result.status = "помилка"
+                result.action = "пропущено"
+                result.error = "Папка вже не існує"
+                error_count += 1
+                self.log(f"Помилка: папка не існує: {target}")
+                continue
+
             try:
-                if ScanWorker._is_folder_empty(target):
-                    os.rmdir(target)
-                    result.action = "видалено"
-                    deleted_count += 1
-                    self.log(f"Видалено: {target}")
-                else:
-                    result.action = "пропущено"
+                if not ScanWorker._is_folder_empty(target):
                     result.status = "не порожня"
+                    result.action = "пропущено"
+                    skipped_count += 1
                     self.log(f"Пропущено (вже не порожня): {target}")
+                    continue
+
+                if dry_run:
+                    result.action = "буде видалено"
+                    self.log(f"Тестовий режим: буде видалено {target}")
+                    continue
+
+                os.rmdir(target)
+                result.action = "видалено"
+                deleted_count += 1
+                self.log(f"Видалено: {target}")
+            except (PermissionError, FileNotFoundError, OSError) as exc:
+                result.status = "помилка"
+                result.action = "пропущено"
+                result.error = str(exc)
+                error_count += 1
+                self.log(f"Помилка видалення '{target}': {exc}")
             except Exception as exc:
                 result.status = "помилка"
                 result.action = "пропущено"
                 result.error = str(exc)
-                self.log(f"Помилка видалення '{target}': {exc}")
+                error_count += 1
+                self.log(f"Неочікувана помилка видалення '{target}': {exc}")
 
         self._refresh_table()
-        QMessageBox.information(self, "Готово", f"Видалено папок: {deleted_count}")
+        self._update_action_buttons_after_scan()
+        self.log(
+            "Результат видалення: "
+            f"оброблено={processed}, видалено={deleted_count}, пропущено={skipped_count}, помилок={error_count}"
+        )
+
+        if dry_run:
+            QMessageBox.information(
+                self,
+                "Тестовий режим",
+                f"Оброблено папок: {processed}. Позначено 'буде видалено': {sum(1 for r in self.results if r.action == 'буде видалено')}",
+            )
+        else:
+            QMessageBox.information(self, "Готово", f"Видалено папок: {deleted_count}")
 
     def _refresh_table(self):
         self.table.setRowCount(0)
@@ -323,12 +448,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Інформація", "Немає результатів для експорту.")
             return
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Зберегти CSV",
-            "results.csv",
-            "CSV файли (*.csv)",
-        )
+        file_path, _ = QFileDialog.getSaveFileName(self, "Зберегти CSV", "results.csv", "CSV файли (*.csv)")
         if not file_path:
             return
 
@@ -339,14 +459,16 @@ class MainWindow(QMainWindow):
                 for r in self.results:
                     writer.writerow([r.path, r.folder_name, r.status, r.action, r.error])
             self.log(f"Експортовано в CSV: {file_path}")
-        except Exception as exc:
+        except (PermissionError, FileNotFoundError, OSError) as exc:
             self.log(f"Помилка експорту CSV: {exc}")
             QMessageBox.critical(self, "Помилка", f"Не вдалося експортувати CSV: {exc}")
 
-    def clear_results(self):
+    def clear_results(self, log_message: bool = True):
         self.results = []
         self.table.setRowCount(0)
-        self.log("Результати очищено.")
+        self._update_action_buttons_after_scan()
+        if log_message:
+            self.log("Результати очищено.")
 
     def log(self, message: str):
         self.log_text.appendPlainText(message)
@@ -359,7 +481,7 @@ class MainWindow(QMainWindow):
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as exc:
+        except (PermissionError, FileNotFoundError, OSError) as exc:
             self.log(f"Помилка збереження налаштувань: {exc}")
 
     def _load_settings(self):
@@ -371,10 +493,15 @@ class MainWindow(QMainWindow):
             self.root_dir_edit.setText(data.get("last_directory", ""))
             self.names_text.setPlainText(data.get("folder_names", ""))
             self.log("Налаштування завантажено.")
-        except Exception as exc:
+        except (PermissionError, FileNotFoundError, OSError, json.JSONDecodeError) as exc:
             self.log(f"Помилка завантаження налаштувань: {exc}")
 
     def closeEvent(self, event):
+        if self.scan_worker:
+            self.scan_worker.cancel()
+        if self.scan_thread and self.scan_thread.isRunning():
+            self.scan_thread.quit()
+            self.scan_thread.wait(2000)
         self._save_settings()
         super().closeEvent(event)
 
