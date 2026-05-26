@@ -1,5 +1,4 @@
 import csv
-import getpass
 import json
 import os
 import sys
@@ -10,14 +9,17 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QPlainTextEdit,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -41,7 +43,7 @@ class ScanResult:
 class ScanWorker(QObject):
     progress = Signal(object)
     log = Signal(str)
-    finished = Signal(list, bool)  # results, cancelled
+    finished = Signal(list, bool)
 
     def __init__(self, root_dir: str, target_names: list[str]):
         super().__init__()
@@ -56,21 +58,17 @@ class ScanWorker(QObject):
     def run(self):
         results: list[ScanResult] = []
         cancelled = False
-
         try:
             for dirpath, dirnames, _ in os.walk(self.root_dir):
                 if self.cancel_requested:
                     cancelled = True
                     break
-
                 for dirname in list(dirnames):
                     if self.cancel_requested:
                         cancelled = True
                         break
-
                     if dirname not in self.target_names:
                         continue
-
                     folder_path = os.path.join(dirpath, dirname)
                     try:
                         is_empty = self._is_folder_empty(folder_path)
@@ -89,7 +87,6 @@ class ScanWorker(QObject):
                         results.append(result)
                         self.progress.emit(result)
                         self.log.emit(f"Неочікувана помилка для '{folder_path}': {exc}")
-
                 if cancelled:
                     break
         except (PermissionError, FileNotFoundError, OSError) as exc:
@@ -107,6 +104,65 @@ class ScanWorker(QObject):
         return True
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, parent, protect_enabled: bool, protect_nested: bool, protected_dirs: list[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Налаштування")
+        self.resize(700, 420)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Захищені директорії:"))
+
+        self.protect_enabled_checkbox = QCheckBox("Увімкнути захист директорій")
+        self.protect_enabled_checkbox.setChecked(protect_enabled)
+        layout.addWidget(self.protect_enabled_checkbox)
+
+        self.protect_nested_checkbox = QCheckBox("Блокувати також вкладені папки захищених директорій")
+        self.protect_nested_checkbox.setChecked(protect_nested)
+        layout.addWidget(self.protect_nested_checkbox)
+
+        self.list_widget = QListWidget()
+        for path in protected_dirs:
+            self.list_widget.addItem(QListWidgetItem(path))
+        layout.addWidget(self.list_widget)
+
+        buttons = QHBoxLayout()
+        add_btn = QPushButton("Додати директорію")
+        add_btn.clicked.connect(self.add_directory)
+        buttons.addWidget(add_btn)
+        remove_btn = QPushButton("Видалити зі списку")
+        remove_btn.clicked.connect(self.remove_directory)
+        buttons.addWidget(remove_btn)
+        clear_btn = QPushButton("Очистити список")
+        clear_btn.clicked.connect(self.list_widget.clear)
+        buttons.addWidget(clear_btn)
+        layout.addLayout(buttons)
+
+        action_buttons = QHBoxLayout()
+        save_btn = QPushButton("Зберегти")
+        save_btn.clicked.connect(self.accept)
+        action_buttons.addWidget(save_btn)
+        cancel_btn = QPushButton("Скасувати")
+        cancel_btn.clicked.connect(self.reject)
+        action_buttons.addWidget(cancel_btn)
+        layout.addLayout(action_buttons)
+
+    def add_directory(self):
+        folder = QFileDialog.getExistingDirectory(self, "Оберіть захищену директорію")
+        if not folder:
+            return
+        existing = {self.list_widget.item(i).text() for i in range(self.list_widget.count())}
+        if folder not in existing:
+            self.list_widget.addItem(QListWidgetItem(folder))
+
+    def remove_directory(self):
+        for item in self.list_widget.selectedItems():
+            self.list_widget.takeItem(self.list_widget.row(item))
+
+    def get_directories(self) -> list[str]:
+        return [self.list_widget.item(i).text().strip() for i in range(self.list_widget.count()) if self.list_widget.item(i).text().strip()]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -117,6 +173,10 @@ class MainWindow(QMainWindow):
         self.scan_thread: QThread | None = None
         self.scan_worker: ScanWorker | None = None
         self.current_root_dir: str = ""
+
+        self.protect_directories_enabled = False
+        self.protect_nested_directories = True
+        self.protected_directories: list[str] = []
 
         self._build_ui()
         self._load_settings()
@@ -170,6 +230,10 @@ class MainWindow(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_results)
         controls_layout.addWidget(self.clear_btn)
 
+        self.settings_btn = QPushButton("Налаштування")
+        self.settings_btn.clicked.connect(self.open_settings)
+        controls_layout.addWidget(self.settings_btn)
+
         main_layout.addLayout(controls_layout)
 
         self.table = QTableWidget(0, 4)
@@ -196,28 +260,15 @@ class MainWindow(QMainWindow):
         except ValueError:
             return False
 
-    def _forbidden_paths(self) -> set[str]:
-        username = getpass.getuser()
-        drive_roots = [f"{drive}:\\" for drive in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{drive}:\\")]
-
-        hardcoded = [
-            r"C:\Windows",
-            r"C:\Program Files",
-            r"C:\Program Files (x86)",
-            r"C:\ProgramData",
-            r"C:\Users",
-            fr"C:\Users\{username}",
-            fr"C:\Users\{username}\Desktop",
-            fr"C:\Users\{username}\Documents",
-            fr"C:\Users\{username}\Downloads",
-        ]
-
-        return {self._normalize(p) for p in drive_roots + hardcoded if os.path.exists(p)}
-
-    def _is_forbidden_selected_root(self, candidate: str) -> bool:
-        normalized_candidate = self._normalize(candidate)
-        for forbidden in self._forbidden_paths():
-            if self._is_subpath_or_same(forbidden, normalized_candidate):
+    def _is_protected_directory(self, candidate: str) -> bool:
+        if not self.protect_directories_enabled:
+            return False
+        norm_candidate = self._normalize(candidate)
+        for protected in self.protected_directories:
+            norm_protected = self._normalize(protected)
+            if norm_candidate == norm_protected:
+                return True
+            if self.protect_nested_directories and self._is_subpath_or_same(norm_protected, norm_candidate):
                 return True
         return False
 
@@ -240,13 +291,9 @@ class MainWindow(QMainWindow):
         if not os.path.isdir(root_dir):
             QMessageBox.warning(self, "Увага", "Вказана директорія не існує.")
             return False
-        if self._is_forbidden_selected_root(root_dir):
-            QMessageBox.warning(
-                self,
-                "Заборонена директорія",
-                "Обрана директорія належить до заборонених системних шляхів. Сканування скасовано.",
-            )
-            self.log(f"Спроба сканування забороненої директорії: {root_dir}")
+        if self._is_protected_directory(root_dir):
+            QMessageBox.warning(self, "Захищена директорія", "Сканування скасовано: обрана директорія належить до захищених.")
+            self.log(f"Сканування заблоковано: '{root_dir}' належить до захищених директорій.")
             return False
         return True
 
@@ -266,6 +313,8 @@ class MainWindow(QMainWindow):
         self.log("Початок сканування")
         self.log(f"Обрана головна директорія: {self.current_root_dir}")
         self.log(f"Кількість назв папок у списку: {len(target_names)}")
+        self.log(f"Захист директорій: {'увімкнено' if self.protect_directories_enabled else 'вимкнено'}")
+        self.log(f"Кількість директорій у списку захисту: {len(self.protected_directories)}")
 
         self.scan_btn.setEnabled(False)
         self.stop_scan_btn.setEnabled(True)
@@ -337,34 +386,26 @@ class MainWindow(QMainWindow):
         norm_root = self._normalize(root_dir)
         dry_run = self.dry_run_checkbox.isChecked()
 
-        candidates = [
-            r for r in self.results
-            if r.status == "порожня" and r.action == "кандидат на видалення"
-        ]
+        candidates = [r for r in self.results if r.status == "порожня" and r.action == "кандидат на видалення"]
         if not candidates:
             QMessageBox.information(self, "Інформація", "Немає порожніх папок для видалення.")
             return
 
-        confirm = QMessageBox.question(
-            self,
-            "Підтвердження видалення",
-            f"Ви дійсно хочете обробити {len(candidates)} порожніх папок?",
-        )
+        confirm = QMessageBox.question(self, "Підтвердження видалення", f"Ви дійсно хочете обробити {len(candidates)} порожніх папок?")
         if confirm != QMessageBox.Yes:
             self.log("Користувач скасував видалення.")
             return
 
-        forbidden_paths = self._forbidden_paths()
-
-        processed = 0
-        deleted_count = 0
-        skipped_count = 0
-        error_count = 0
-
+        processed = deleted_count = skipped_count = error_count = 0
         for result in candidates:
             processed += 1
             target = os.path.abspath(result.path)
             norm_target = self._normalize(target)
+
+            if result.status != "порожня":
+                result.action = "пропущено"
+                skipped_count += 1
+                continue
 
             if norm_target == norm_root:
                 result.action = "пропущено"
@@ -372,10 +413,10 @@ class MainWindow(QMainWindow):
                 self.log(f"Пропущено головну директорію: {target}")
                 continue
 
-            if any(self._is_subpath_or_same(forbidden, norm_target) for forbidden in forbidden_paths):
+            if self.protect_directories_enabled and self._is_protected_directory(target):
                 result.action = "пропущено"
                 skipped_count += 1
-                self.log(f"Пропущено (заборонений системний шлях): {target}")
+                self.log(f"Пропущено (захищена директорія): {target}")
                 continue
 
             if not self._is_subpath_or_same(root_dir, target):
@@ -424,17 +465,10 @@ class MainWindow(QMainWindow):
 
         self._refresh_table()
         self._update_action_buttons_after_scan()
-        self.log(
-            "Результат видалення: "
-            f"оброблено={processed}, видалено={deleted_count}, пропущено={skipped_count}, помилок={error_count}"
-        )
+        self.log("Результат видалення: " f"оброблено={processed}, видалено={deleted_count}, пропущено={skipped_count}, помилок={error_count}")
 
         if dry_run:
-            QMessageBox.information(
-                self,
-                "Тестовий режим",
-                f"Оброблено папок: {processed}. Позначено 'буде видалено': {sum(1 for r in self.results if r.action == 'буде видалено')}",
-            )
+            QMessageBox.information(self, "Тестовий режим", f"Оброблено папок: {processed}. Позначено 'буде видалено': {sum(1 for r in self.results if r.action == 'буде видалено')}")
         else:
             QMessageBox.information(self, "Готово", f"Видалено папок: {deleted_count}")
 
@@ -473,10 +507,23 @@ class MainWindow(QMainWindow):
     def log(self, message: str):
         self.log_text.appendPlainText(message)
 
+    def open_settings(self):
+        dialog = SettingsDialog(self, self.protect_directories_enabled, self.protect_nested_directories, self.protected_directories)
+        if dialog.exec() == QDialog.Accepted:
+            self.protect_directories_enabled = dialog.protect_enabled_checkbox.isChecked()
+            self.protect_nested_directories = dialog.protect_nested_checkbox.isChecked()
+            self.protected_directories = dialog.get_directories()
+            self._save_settings()
+            self.log("Налаштування захищених директорій оновлено.")
+
     def _save_settings(self):
         data = {
             "last_directory": self.root_dir_edit.text().strip(),
             "folder_names": self.names_text.toPlainText(),
+            "dry_run": self.dry_run_checkbox.isChecked(),
+            "protect_directories_enabled": self.protect_directories_enabled,
+            "protect_nested_directories": self.protect_nested_directories,
+            "protected_directories": self.protected_directories,
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -492,6 +539,10 @@ class MainWindow(QMainWindow):
                 data = json.load(f)
             self.root_dir_edit.setText(data.get("last_directory", ""))
             self.names_text.setPlainText(data.get("folder_names", ""))
+            self.dry_run_checkbox.setChecked(data.get("dry_run", True))
+            self.protect_directories_enabled = data.get("protect_directories_enabled", False)
+            self.protect_nested_directories = data.get("protect_nested_directories", True)
+            self.protected_directories = data.get("protected_directories", [])
             self.log("Налаштування завантажено.")
         except (PermissionError, FileNotFoundError, OSError, json.JSONDecodeError) as exc:
             self.log(f"Помилка завантаження налаштувань: {exc}")
