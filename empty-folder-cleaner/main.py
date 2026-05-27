@@ -184,7 +184,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle(APP_NAME); self.resize(1200,760)
-        self.results=[]; self.catalog_results=[]; self.scan_thread=None; self.scan_worker=None; self.catalog_thread=None; self.catalog_worker=None; self.current_root_dir=""; self.current_catalog_source=""
+        self.results=[]; self.catalog_results=[]; self.scan_thread=None; self.scan_worker=None; self.catalog_thread=None; self.catalog_worker=None; self.current_root_dir=""; self.current_catalog_source=""; self.last_scan_result_paths=set()
         self.protect_directories_enabled=False; self.protect_nested_directories=True; self.protected_directories=[]; self.ignored_files_enabled=True; self.ignored_files=DEFAULT_IGNORED_FILES.copy()
         self._build_ui(); self._load_settings(); self._update_action_buttons_after_scan(); self._update_catalog_buttons()
 
@@ -212,8 +212,9 @@ class MainWindow(QMainWindow):
         ml.addWidget(QLabel("Каталоги, які потрібно знайти (по одному в рядку):")); self.target_catalogs_text=QPlainTextEdit(); self.target_catalogs_text.setFixedHeight(100); ml.addWidget(self.target_catalogs_text)
         ml.addWidget(QLabel("Папки, які мають бути всередині кожного каталогу (по одній в рядку):")); self.required_folders_text=QPlainTextEdit(); self.required_folders_text.setFixedHeight(100); ml.addWidget(self.required_folders_text)
         ol=QHBoxLayout(); self.ignore_case_checkbox=QCheckBox("Ігнорувати регістр літер"); self.ignore_case_checkbox.setChecked(True); ol.addWidget(self.ignore_case_checkbox); self.trim_spaces_checkbox=QCheckBox("Ігнорувати зайві пробіли на початку і в кінці назв"); self.trim_spaces_checkbox.setChecked(True); ol.addWidget(self.trim_spaces_checkbox); self.full_paths_checkbox=QCheckBox("Показувати повні шляхи"); self.full_paths_checkbox.setChecked(True); ol.addWidget(self.full_paths_checkbox); self.direct_children_checkbox=QCheckBox("Перевіряти тільки безпосередні підпапки всередині знайденого каталогу"); self.direct_children_checkbox.setChecked(True); ol.addWidget(self.direct_children_checkbox); ml.addLayout(ol)
-        bl=QHBoxLayout(); self.catalog_scan_btn=QPushButton("Сканувати каталог"); self.catalog_scan_btn.clicked.connect(self.start_catalog_scan); bl.addWidget(self.catalog_scan_btn); self.catalog_stop_btn=QPushButton("Зупинити сканування"); self.catalog_stop_btn.clicked.connect(self.stop_catalog_scan); self.catalog_stop_btn.setEnabled(False); bl.addWidget(self.catalog_stop_btn); self.catalog_clear_btn=QPushButton("Очистити результати"); self.catalog_clear_btn.clicked.connect(self.clear_catalog_results); bl.addWidget(self.catalog_clear_btn); self.catalog_export_btn=QPushButton("Експорт у CSV"); self.catalog_export_btn.clicked.connect(self.export_catalog_csv); self.catalog_export_btn.setEnabled(False); bl.addWidget(self.catalog_export_btn); ml.addLayout(bl)
+        bl=QHBoxLayout(); self.catalog_scan_btn=QPushButton("Сканувати каталог"); self.catalog_scan_btn.clicked.connect(self.start_catalog_scan); bl.addWidget(self.catalog_scan_btn); self.catalog_stop_btn=QPushButton("Зупинити сканування"); self.catalog_stop_btn.clicked.connect(self.stop_catalog_scan); self.catalog_stop_btn.setEnabled(False); bl.addWidget(self.catalog_stop_btn); self.catalog_create_selected_btn=QPushButton("Створити відсутні для вибраного"); self.catalog_create_selected_btn.clicked.connect(self.create_missing_for_selected); self.catalog_create_selected_btn.setEnabled(False); bl.addWidget(self.catalog_create_selected_btn); self.catalog_create_all_btn=QPushButton("Створити всі відсутні"); self.catalog_create_all_btn.clicked.connect(self.create_missing_for_all); self.catalog_create_all_btn.setEnabled(False); bl.addWidget(self.catalog_create_all_btn); self.catalog_clear_btn=QPushButton("Очистити результати"); self.catalog_clear_btn.clicked.connect(self.clear_catalog_results); bl.addWidget(self.catalog_clear_btn); self.catalog_export_btn=QPushButton("Експорт у CSV"); self.catalog_export_btn.clicked.connect(self.export_catalog_csv); self.catalog_export_btn.setEnabled(False); bl.addWidget(self.catalog_export_btn); ml.addLayout(bl)
         self.catalog_table=QTableWidget(0,8); self.catalog_table.setHorizontalHeaderLabels(["Каталог для перевірки","Статус каталогу","Шлях","Знайдено обов'язкових папок","Всього обов'язкових папок","Відсутні папки","Зайві папки","Коментар"]); self.catalog_table.horizontalHeader().setStretchLastSection(True); self.catalog_table.setColumnWidth(2,340); ml.addWidget(self.catalog_table)
+        self.catalog_table.itemSelectionChanged.connect(self._update_catalog_buttons)
 
     def _normalize(self, p): return os.path.normcase(os.path.normpath(os.path.abspath(p)))
     def _is_subpath_or_same(self, parent, child):
@@ -265,7 +266,7 @@ class MainWindow(QMainWindow):
         if not required: QMessageBox.warning(self,"Увага","Додайте хоча б одну обов'язкову папку."); return
         self.clear_catalog_results(False); self._save_settings(); self.current_catalog_source=self.catalog_source_edit.text().strip()
         self.log("Початок перевірки каталогу"); self.log(f"Обране джерело: {self.current_catalog_source}"); self.log(f"Кількість каталогів для пошуку: {len(targets)}"); self.log(f"Кількість обов'язкових папок: {len(required)}")
-        self.catalog_scan_btn.setEnabled(False); self.catalog_stop_btn.setEnabled(True); self.catalog_export_btn.setEnabled(False)
+        self.catalog_scan_btn.setEnabled(False); self.catalog_stop_btn.setEnabled(True); self.catalog_export_btn.setEnabled(False); self.catalog_create_selected_btn.setEnabled(False); self.catalog_create_all_btn.setEnabled(False)
         self.catalog_thread=QThread(); self.catalog_worker=CatalogCheckWorker(self.current_catalog_source, targets, required, self.ignore_case_checkbox.isChecked(), self.trim_spaces_checkbox.isChecked(), self.full_paths_checkbox.isChecked(), self.direct_children_checkbox.isChecked()); self.catalog_worker.moveToThread(self.catalog_thread)
         self.catalog_thread.started.connect(self.catalog_worker.run); self.catalog_worker.progress.connect(self._append_catalog_result); self.catalog_worker.log.connect(self.log); self.catalog_worker.finished.connect(self._catalog_finished); self.catalog_worker.finished.connect(self.catalog_thread.quit); self.catalog_worker.finished.connect(self.catalog_worker.deleteLater); self.catalog_thread.finished.connect(self.catalog_thread.deleteLater); self.catalog_thread.start()
     def stop_catalog_scan(self):
@@ -275,7 +276,7 @@ class MainWindow(QMainWindow):
     def _scan_finished(self, results, cancelled): self.results=results; self.scan_btn.setEnabled(True); self.stop_scan_btn.setEnabled(False); self.log("Завершення сканування"); self._update_action_buttons_after_scan()
     @Slot(list, dict, bool)
     def _catalog_finished(self, results, stats, cancelled):
-        self.catalog_results=results; self.catalog_scan_btn.setEnabled(True); self.catalog_stop_btn.setEnabled(False); self._update_catalog_buttons()
+        self.catalog_results=results; self.last_scan_result_paths={self._normalize(r.path) for r in results if r.path}; self.catalog_scan_btn.setEnabled(True); self.catalog_stop_btn.setEnabled(False); self._update_catalog_buttons()
         self.log(f"Кількість знайдених каталогів: {stats['found']}"); self.log(f"Кількість не знайдених каталогів: {stats['not_found']}"); self.log(f"Кількість повних: {stats['full']}"); self.log(f"Кількість неповних: {stats['incomplete']}"); self.log(f"Кількість із зайвими: {stats['with_extra']}"); self.log(f"Кількість дублікатів: {stats['duplicates']}"); self.log(f"Кількість помилок: {stats['errors']}" )
         if cancelled: self.log("Перевірку каталогу зупинено користувачем")
         self.log("Завершення перевірки каталогу")
@@ -291,7 +292,109 @@ class MainWindow(QMainWindow):
 
     def _update_action_buttons_after_scan(self):
         self.export_btn.setEnabled(bool(self.results)); self.delete_btn.setEnabled(any(r.status in {"порожня","умовно порожня"} and r.action=="кандидат на видалення" for r in self.results))
-    def _update_catalog_buttons(self): self.catalog_export_btn.setEnabled(bool(self.catalog_results))
+    def _update_catalog_buttons(self):
+        self.catalog_export_btn.setEnabled(bool(self.catalog_results))
+        has_any_missing=any(self._row_can_create(r, allow_duplicate=True) for r in self.catalog_results)
+        self.catalog_create_all_btn.setEnabled(bool(self.catalog_results) and has_any_missing)
+        row=self.catalog_table.currentRow()
+        selected=self.catalog_results[row] if 0 <= row < len(self.catalog_results) else None
+        self.catalog_create_selected_btn.setEnabled(bool(selected) and self._row_can_create(selected, allow_duplicate=True))
+
+    def _required_folder_names(self):
+        names=[]; seen=set()
+        for raw in self._list_from_text(self.required_folders_text):
+            name=raw.strip() if self.trim_spaces_checkbox.isChecked() else raw
+            key=name.casefold() if self.ignore_case_checkbox.isChecked() else name
+            if name and key not in seen: seen.add(key); names.append(name)
+        return names
+    def _parse_missing(self, r): return [n.strip() for n in r.missing_folders.split(",") if n.strip()]
+    def _row_can_create(self, r, allow_duplicate):
+        if r.status in {"не знайдено","помилка"}: return False
+        if r.status == "дублікат" and not allow_duplicate: return False
+        return bool(r.path and self._parse_missing(r))
+    def _is_valid_folder_name(self, name):
+        return bool(name) and name not in {".",".."} and not any(c in name for c in '\\/:*?"<>|')
+
+    def _safe_create_missing_for_row(self, r, required_names):
+        planned=self._parse_missing(r); created=skipped=errors=0; details=[]
+        base_path=Path(r.path)
+        normalized_base=self._normalize(str(base_path))
+        if normalized_base not in self.last_scan_result_paths:
+            return {"planned":len(planned),"created":0,"skipped":len(planned),"errors":0,"details":["Каталог відсутній у результатах останнього сканування"],"comment":"Пропущено: каталог недоступний"}
+        for folder_name in planned:
+            try:
+                if not base_path.exists() or not base_path.is_dir(): skipped += 1; details.append(f"Пропущено '{folder_name}': каталог недоступний {base_path}"); continue
+                if folder_name not in required_names: skipped += 1; details.append(f"Пропущено '{folder_name}': не входить в еталонний список"); continue
+                if not self._is_valid_folder_name(folder_name): skipped += 1; details.append(f"Пропущено '{folder_name}': некоректна назва"); continue
+                target=base_path / folder_name
+                if target.exists(): skipped += 1; continue
+                target.mkdir(exist_ok=True); created += 1
+            except (PermissionError, FileExistsError, FileNotFoundError, OSError) as exc:
+                errors += 1; details.append(f"Помилка '{base_path / folder_name}': {exc}")
+        if errors: comment="Частково створено, є помилки"
+        elif created > 0: comment="Відсутні папки створено"
+        else: comment="Пропущено: каталог недоступний"
+        return {"planned":len(planned),"created":created,"skipped":skipped,"errors":errors,"details":details,"comment":comment}
+
+    def _refresh_catalog_row_state(self, r):
+        required_names=self._required_folder_names()
+        try:
+            base=Path(r.path)
+            actual={}
+            for e in base.iterdir():
+                if e.is_dir():
+                    key=e.name.casefold() if self.ignore_case_checkbox.isChecked() else e.name
+                    if key not in actual: actual[key]=e.name
+            req={}
+            for n in required_names:
+                key=n.casefold() if self.ignore_case_checkbox.isChecked() else n
+                if key not in req: req[key]=n
+            missing=[name for k,name in req.items() if k not in actual]; extra=[name for k,name in actual.items() if k not in req]
+            r.total_required=len(req); r.found_required=r.total_required-len(missing); r.missing_folders=", ".join(missing); r.extra_folders=", ".join(extra)
+            if r.status != "дублікат":
+                if missing: r.status="неповний"
+                elif extra: r.status="повний із зайвими"
+                else: r.status="повний"
+        except (PermissionError, FileNotFoundError, OSError):
+            r.comment="Пропущено: каталог недоступний"
+
+    def create_missing_for_selected(self):
+        row=self.catalog_table.currentRow()
+        if row < 0 or row >= len(self.catalog_results): return
+        r=self.catalog_results[row]
+        if not self._row_can_create(r, allow_duplicate=True): return
+        missing=self._parse_missing(r)
+        if QMessageBox.question(self,"Підтвердження створення",f"Каталог: {r.path}\n\nБуде створено папок: {len(missing)}\n{chr(10).join(missing)}") != QMessageBox.Yes: return
+        self.log(f"Початок створення відсутніх папок. Режим: вибраний рядок. Заплановано: {len(missing)}")
+        report=self._safe_create_missing_for_row(r, self._required_folder_names()); r.comment=report["comment"]; self._refresh_catalog_row_state(r); self._refresh_catalog_table()
+        self.log(f"Створення завершено. Режим: вибраний рядок. Успішно: {report['created']}. Пропущено: {report['skipped']}. Помилок: {report['errors']}")
+        for d in report["details"]: self.log(d)
+        self._update_catalog_buttons()
+
+    def create_missing_for_all(self):
+        rows=[r for r in self.catalog_results if self._row_can_create(r, allow_duplicate=True)]
+        if not rows: return
+        duplicates_present=any(r.status=="дублікат" for r in rows)
+        total_folders=sum(len(self._parse_missing(r)) for r in rows)
+        preview=[]
+        for r in rows:
+            for name in self._parse_missing(r):
+                preview.append(str(Path(r.path)/name))
+                if len(preview) >= 20: break
+            if len(preview) >= 20: break
+        warning="\n\nУвага: серед результатів є дублікати." if duplicates_present else ""
+        if QMessageBox.question(self,"Підтвердження масового створення",f"Каталогів: {len(rows)}\nЗаплановано створити папок: {total_folders}\n\nПерші шляхи:\n{chr(10).join(preview)}{warning}") != QMessageBox.Yes: return
+        self.log(f"Початок створення відсутніх папок. Режим: усі. Заплановано: {total_folders}")
+        created=skipped=errors=0
+        for r in rows:
+            report=self._safe_create_missing_for_row(r, self._required_folder_names()); created += report["created"]; skipped += report["skipped"]; errors += report["errors"]; r.comment=report["comment"]; self._refresh_catalog_row_state(r)
+            for d in report["details"]: self.log(d)
+        self._refresh_catalog_table(); self._update_catalog_buttons()
+        self.log(f"Створення завершено. Режим: усі. Успішно: {created}. Пропущено: {skipped}. Помилок: {errors}")
+
+    def _refresh_catalog_table(self):
+        self.catalog_table.setRowCount(0)
+        for r in self.catalog_results: self._append_catalog_result(r)
 
     def _recheck_for_deletion(self, folder_path):
         ignored=[]
@@ -341,7 +444,7 @@ class MainWindow(QMainWindow):
         self.log(f"Експорт перевірки каталогу в CSV: {p}")
 
     def clear_results(self, log_message=True): self.results=[]; self.table.setRowCount(0); self._update_action_buttons_after_scan();
-    def clear_catalog_results(self, log_message=True): self.catalog_results=[]; self.catalog_table.setRowCount(0); self._update_catalog_buttons();
+    def clear_catalog_results(self, log_message=True): self.catalog_results=[]; self.last_scan_result_paths=set(); self.catalog_table.setRowCount(0); self._update_catalog_buttons();
     def log(self, message): self.log_text.appendPlainText(message)
 
     def open_settings(self):
